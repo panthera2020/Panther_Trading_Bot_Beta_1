@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from threading import Event, Thread
-from time import sleep
+from time import sleep, time as _time
 from typing import Dict, List, Optional
+import logging
 
 from exchange.base import ExchangeClient
 from execution.order_manager import OrderManager, OrderManagerConfig
@@ -19,6 +20,8 @@ from strategies.mean_reversion import MeanReversionConfig, MeanReversionStrategy
 from strategies.strategy_c import StrategyC, StrategyCConfig
 from strategies.trend_breakout import TrendBreakoutConfig, TrendBreakoutStrategy
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class BotConfig:
@@ -26,7 +29,9 @@ class BotConfig:
     monthly_volume_target: float = 3_000_000.0
     trading_days: int = 30
     expected_trades_left: Dict[str, int] = None
-    equity: float = 100_000.0
+    # equity is now a FALLBACK default, not the primary source.
+    # The bot fetches real equity from the exchange before every sizing cycle.
+    equity: float = 500.0  # Fallback only â€” real equity is fetched from exchange on startup
     test_trade_qty: float = 0.001
     test_trade_symbol: str = "BTCUSDT"
     poll_interval_seconds: int = 60
@@ -35,6 +40,10 @@ class BotConfig:
     vol_spike_mult: float = 3.0
     entry_wait_minutes: int = 5
     cooldown_seconds: int = 120
+    # NEW: margin safety buffer â€” require at least 20% free margin after trade
+    margin_safety_pct: float = 0.20
+    # NEW: balance cache TTL in seconds (avoid hammering API)
+    balance_cache_ttl: float = 15.0
 
 
 class TradingBot:
@@ -77,6 +86,78 @@ class TradingBot:
         self._mode = BotMode.IDLE
         self._stop_event = Event()
         self._loop_thread: Optional[Thread] = None
+        # NEW: cached balance data
+        self._cached_balance: Dict[str, float] = {}
+        self._balance_cache_ts: float = 0.0
+
+    # â”€â”€â”€ LIVE EQUITY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _get_live_equity(self) -> float:
+        """
+        Return the real account equity from the exchange, with a short cache
+        to avoid hammering the API on every sizing call within the same poll.
+        Falls back to config.equity if the API call fails.
+        """
+        now = _time()
+        if self._cached_balance and (now - self._balance_cache_ts) < self.config.balance_cache_ttl:
+            return float(self._cached_balance.get("total_equity", self.config.equity) or self.config.equity)
+
+        try:
+            balance = self.exchange_client.get_balance()
+            equity = float(balance.get("total_equity", 0.0) or 0.0)
+            if equity > 0:
+                self._cached_balance = balance
+                self._balance_cache_ts = now
+                self.config.equity = equity  # keep config in sync for status display
+                return equity
+            else:
+                logger.warning("Exchange returned zero equity, using cached/config value")
+                return self.config.equity
+        except Exception as exc:
+            logger.warning(f"Failed to fetch balance: {exc}. Using config equity={self.config.equity}")
+            self.last_error = str(exc)
+            return self.config.equity
+
+    def _get_available_margin(self) -> float:
+        """Return the available margin from the last balance fetch."""
+        self._get_live_equity()  # ensure cache is fresh
+        return float(self._cached_balance.get("available_balance", 0.0) or 0.0)
+
+    def _margin_check(self, price: float, qty: float, symbol: str) -> bool:
+        """
+        Pre-trade margin validation.
+        Ensure the notional value of the position doesn't exceed available margin
+        minus a safety buffer. This prevents the bot from sending orders that
+        Bybit will reject with insufficient balance.
+        """
+        available = self._get_available_margin()
+        if available <= 0:
+            logger.warning(f"No available margin. symbol={symbol}")
+            self.order_manager.log_event("WARN", f"No available margin. symbol={symbol}")
+            return False
+
+        notional = price * qty
+        # With leverage, the required margin is notional / leverage
+        leverage = getattr(getattr(self.exchange_client, 'config', None), 'leverage', 50)
+        required_margin = notional / leverage
+        # Keep a safety buffer
+        max_margin = available * (1.0 - self.config.margin_safety_pct)
+
+        if required_margin > max_margin:
+            logger.warning(
+                f"Margin check FAILED. symbol={symbol} "
+                f"required_margin={required_margin:.2f} available={available:.2f} "
+                f"max_usable={max_margin:.2f} notional={notional:.2f}"
+            )
+            self.order_manager.log_event(
+                "WARN",
+                f"Margin check failed: need ${required_margin:.2f} but only ${max_margin:.2f} available. symbol={symbol}",
+            )
+            return False
+
+        return True
+
+    # â”€â”€â”€ STARTUP / CONTROL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def start(self, strategies: Optional[List[str]] = None, run_test_trade: bool = True) -> None:
         if self.state in {BotState.TERMINATED, BotState.ERROR}:
@@ -85,6 +166,22 @@ class TradingBot:
             self.enabled_strategies = set(strategies)
         else:
             self.enabled_strategies = {"trend", "scalp", "candle3"}
+
+        # Fetch real equity on startup so all sizing uses the actual balance
+        startup_equity = self._get_live_equity()
+        risk_pct = self.risk_manager.config.risk_per_trade_pct
+        risk_per_trade = risk_pct * startup_equity
+        logger.info(
+            f"Bot starting | Live equity: ${startup_equity:,.2f} | "
+            f"Risk per trade: {risk_pct:.1%} = ${risk_per_trade:,.2f} | "
+            f"Min notional: ${self.MIN_NOTIONAL_USD:.2f}"
+        )
+        if startup_equity < 50:
+            logger.warning(
+                f"Very low equity (${startup_equity:,.2f}). "
+                f"Some trades may be skipped if position size is below exchange minimums."
+            )
+
         if run_test_trade:
             self._strategies_enabled = False
             self._test_trade_in_progress = True
@@ -173,6 +270,11 @@ class TradingBot:
             )
         return merged
 
+    # â”€â”€â”€ POSITION SIZING (FIXED) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    # Bybit minimum notional value for perpetual orders (USD)
+    MIN_NOTIONAL_USD: float = 5.0
+
     def _size_for_strategy(
         self,
         strategy_id: str,
@@ -181,19 +283,43 @@ class TradingBot:
         k: float,
         timestamp: datetime,
     ) -> float:
+        # FIXED: Use live equity instead of hardcoded config value
+        live_equity = self._get_live_equity()
+
         session = self.session_manager.current_session(timestamp)
         size_mult = session.strategy_size_mult.get(strategy_id, 1.0)
         base_size = self.volume_manager.compute_size(
             strategy_id=strategy_id,
             risk_pct=self.risk_manager.config.risk_per_trade_pct,
-            equity=self.config.equity,
+            equity=live_equity,  # FIXED: was self.config.equity (hardcoded)
             atr=atr_value,
             k=k,
             expected_trades_left=self.expected_trades_left.get(strategy_id, 1),
             price=price,
             timestamp=timestamp,
         )
-        return base_size * size_mult
+        final_size = base_size * size_mult
+
+        # Log sizing details for debugging small accounts
+        notional = final_size * price if price > 0 else 0.0
+        risk_dollar = self.risk_manager.config.risk_per_trade_pct * live_equity
+        logger.debug(
+            f"[SIZE] {strategy_id}: equity=${live_equity:,.2f} "
+            f"risk=${risk_dollar:,.2f} atr={atr_value:.2f} "
+            f"size={final_size:.6f} notional=${notional:,.2f}"
+        )
+
+        # Skip if notional is below exchange minimum
+        if notional < self.MIN_NOTIONAL_USD:
+            logger.warning(
+                f"Notional ${notional:.2f} below minimum ${self.MIN_NOTIONAL_USD:.2f} "
+                f"for {strategy_id}. equity=${live_equity:,.2f}. Skipping trade."
+            )
+            return 0.0
+
+        return final_size
+
+    # â”€â”€â”€ MARKET DATA HANDLER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def on_market_data(
         self,
@@ -210,7 +336,10 @@ class TradingBot:
             return
 
         ts = timestamp or datetime.now(timezone.utc)
+
+        # FIXED: _refresh_equity now uses _get_live_equity with caching
         self._refresh_equity()
+
         if not self.risk_manager.can_trade(self.config.equity, ts):
             return
 
@@ -274,6 +403,9 @@ class TradingBot:
                         size = self.exchange_client.normalize_qty(symbol, size)
                         if size <= 0:
                             continue
+                        # NEW: Pre-trade margin check
+                        if not self._margin_check(price, size, symbol):
+                            continue
                         signal = self.trend_strategy.generate_signal(candles, size, symbol, ts)
                         if signal:
                             try:
@@ -291,6 +423,9 @@ class TradingBot:
                     size = self._size_for_strategy("scalp", atr_val, price, self.scalp_strategy.config.atr_k, ts)
                     size = self.exchange_client.normalize_qty(symbol, size)
                     if size <= 0:
+                        continue
+                    # NEW: Pre-trade margin check
+                    if not self._margin_check(price, size, symbol):
                         continue
                     signal = self.scalp_strategy.generate_signal(candles, size, symbol, ts)
                     if signal:
@@ -312,10 +447,12 @@ class TradingBot:
                     risk = abs(signal.price - signal.stop_loss)
                     if risk <= 0:
                         continue
+                    # FIXED: Use live equity
+                    live_equity = self._get_live_equity()
                     size = self.volume_manager.compute_size(
                         strategy_id="candle3",
                         risk_pct=self.risk_manager.config.risk_per_trade_pct,
-                        equity=self.config.equity,
+                        equity=live_equity,  # FIXED: was self.config.equity
                         atr=risk,
                         k=1.0,
                         expected_trades_left=self.expected_trades_left.get("candle3", 1),
@@ -324,6 +461,9 @@ class TradingBot:
                     )
                     size = self.exchange_client.normalize_qty(symbol, size)
                     if size <= 0:
+                        continue
+                    # NEW: Pre-trade margin check
+                    if not self._margin_check(signal.price, size, symbol):
                         continue
                     signal = TradeSignal(
                         symbol=signal.symbol,
@@ -361,13 +501,9 @@ class TradingBot:
         return sum(trs) / 14
 
     def _refresh_equity(self) -> None:
-        try:
-            balance = self.exchange_client.get_balance()
-            equity = float(balance.get("total_equity", self.config.equity) or self.config.equity)
-            if equity > 0:
-                self.config.equity = equity
-        except Exception as exc:
-            self.last_error = str(exc)
+        """Refresh equity using the cached live balance fetcher."""
+        equity = self._get_live_equity()
+        logger.debug(f"Equity refreshed: ${equity:,.2f}")
 
     def _apply_breakeven(self, symbol: str, ts: datetime) -> None:
         position = self.position_manager.get_position(symbol, "trend")
@@ -446,10 +582,12 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: invalid risk. symbol={symbol}")
             return
 
+        # FIXED: Use live equity
+        live_equity = self._get_live_equity()
         size = self.volume_manager.compute_size(
             strategy_id="trend",
             risk_pct=self.risk_manager.config.risk_per_trade_pct,
-            equity=self.config.equity,
+            equity=live_equity,  # FIXED: was self.config.equity
             atr=risk,
             k=1.0,
             expected_trades_left=self.expected_trades_left.get("trend", 1),
@@ -458,6 +596,19 @@ class TradingBot:
         )
         if size <= 0:
             self.order_manager.log_event("INFO", f"Hybrid: size below min. symbol={symbol}")
+            return
+
+        # Min notional check for hybrid
+        notional = size * entry_price
+        if notional < self.MIN_NOTIONAL_USD:
+            logger.warning(
+                f"Hybrid: notional ${notional:.2f} below min ${self.MIN_NOTIONAL_USD:.2f}. Skipping."
+            )
+            self.order_manager.log_event("INFO", f"Hybrid: notional too small. symbol={symbol}")
+            return
+
+        # NEW: Pre-trade margin check
+        if not self._margin_check(entry_price, size, symbol):
             return
 
         if bias == "LONG":

@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,11 +73,38 @@ class VolumeManager:
         price: float,
         timestamp: datetime,
     ) -> float:
+        """
+        Compute position size using the SMALLER of risk-based and volume-based sizing.
+
+        Risk-based sizing is the PRIMARY method: size = (risk% * equity) / (atr * k).
+        Volume-based sizing is a SOFT CAP â€” it limits position size to stay on pace
+        for the daily volume target, but it never INCREASES beyond the risk-based size.
+
+        If the account is too small to meet the volume target with 1% risk, the risk
+        limit wins. Volume targets are aspirational, not mandatory.
+        """
         if atr <= 0 or k <= 0 or price <= 0:
             return 0.0
-        base_size = (risk_pct * equity) / (atr * k)
+
+        # Primary: risk-based sizing using REAL equity
+        risk_size = (risk_pct * equity) / (atr * k)
+
+        # Secondary: volume pacing (soft cap only â€” never pushes size above risk_size)
         remaining_volume = self.strategy_remaining(strategy_id, timestamp)
         if expected_trades_left <= 0:
-            return 0.0
-        max_size = (remaining_volume / expected_trades_left) / price
-        return min(base_size, max_size)
+            expected_trades_left = 1
+        volume_size = (remaining_volume / expected_trades_left) / price
+
+        # Take the SMALLER of the two â€” risk always wins
+        size = min(risk_size, volume_size)
+
+        # Hard floor: if volume target already met, still allow risk-based trades
+        # (don't skip trades just because volume target is reached)
+        if volume_size <= 0 and risk_size > 0:
+            logger.info(
+                f"Volume target met for {strategy_id}, using risk-based size only. "
+                f"risk_size={risk_size:.6f}"
+            )
+            size = risk_size
+
+        return size

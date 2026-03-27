@@ -9,7 +9,7 @@ class RiskConfig:
     max_daily_loss_pct: float = 0.03
     max_consecutive_losses: int = 3
     max_orders_per_hour: int = 20
-    risk_per_trade_pct: float = 0.02
+    risk_per_trade_pct: float = 0.01  # Changed from 0.02 to 0.01 (1% risk per trade)
 
 
 class RiskManager:
