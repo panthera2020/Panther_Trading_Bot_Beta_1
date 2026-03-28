@@ -25,13 +25,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BotConfig:
-    symbols: List[str] = None
+    symbols: list = None
     monthly_volume_target: float = 3_000_000.0
     trading_days: int = 30
-    expected_trades_left: Dict[str, int] = None
+    expected_trades_left: dict = None
     # equity is now a FALLBACK default, not the primary source.
     # The bot fetches real equity from the exchange before every sizing cycle.
-    equity: float = 500.0  # Fallback only â€” real equity is fetched from exchange on startup
+    equity: float = 500.0  # Fallback only — real equity is fetched from exchange on startup
     test_trade_qty: float = 0.001
     test_trade_symbol: str = "BTCUSDT"
     poll_interval_seconds: int = 60
@@ -40,7 +40,7 @@ class BotConfig:
     vol_spike_mult: float = 3.0
     entry_wait_minutes: int = 5
     cooldown_seconds: int = 120
-    # NEW: margin safety buffer â€” require at least 20% free margin after trade
+    # NEW: margin safety buffer — require at least 20% free margin after trade
     margin_safety_pct: float = 0.20
     # NEW: balance cache TTL in seconds (avoid hammering API)
     balance_cache_ttl: float = 15.0
@@ -90,7 +90,7 @@ class TradingBot:
         self._cached_balance: Dict[str, float] = {}
         self._balance_cache_ts: float = 0.0
 
-    # â”€â”€â”€ LIVE EQUITY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── LIVE EQUITY ────────────────────────────────────────────────────────────
 
     def _get_live_equity(self) -> float:
         """
@@ -157,7 +157,7 @@ class TradingBot:
 
         return True
 
-    # â”€â”€â”€ STARTUP / CONTROL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── STARTUP / CONTROL ──────────────────────────────────────────────────────
 
     def start(self, strategies: Optional[List[str]] = None, run_test_trade: bool = True) -> None:
         if self.state in {BotState.TERMINATED, BotState.ERROR}:
@@ -270,7 +270,7 @@ class TradingBot:
             )
         return merged
 
-    # â”€â”€â”€ POSITION SIZING (FIXED) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── POSITION SIZING (FIXED) ─────────────────────────────────────────────────
 
     # Bybit minimum notional value for perpetual orders (USD)
     MIN_NOTIONAL_USD: float = 5.0
@@ -319,7 +319,7 @@ class TradingBot:
 
         return final_size
 
-    # â”€â”€â”€ MARKET DATA HANDLER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── MARKET DATA HANDLER ────────────────────────────────────────────────────
 
     def on_market_data(
         self,
@@ -480,7 +480,7 @@ class TradingBot:
                         self.order_manager.execute_signal(signal, ts)
                         Thread(
                             target=self._monitor_strategy_c,
-                            args=(symbol, "candle3", 30),
+                            args=(symbol, "candle3", 180),  # FIX: 3 candles x 60s = 3-minute minimum hold (was 30)
                             daemon=True,
                         ).start()
                     except Exception as exc:  # exchange errors should halt the bot
@@ -681,7 +681,8 @@ class TradingBot:
 
     def _monitor_strategy_c(self, symbol: str, strategy_id: str, delay_seconds: int) -> None:
         """
-        Close after fixed seconds or on stop-loss.
+        Close after minimum hold period (delay_seconds) or on stop-loss hit.
+        delay_seconds should be >= 180 (3 x 60s candles) to avoid premature exits.
         """
         while True:
             position = self.position_manager.get_position(symbol, strategy_id)
