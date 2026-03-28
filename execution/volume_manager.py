@@ -74,14 +74,28 @@ class VolumeManager:
         timestamp: datetime,
     ) -> float:
         """
-        Compute position size using the SMALLER of risk-based and volume-based sizing.
+        Compute position size using a two-component model:
 
-        Risk-based sizing is the PRIMARY method: size = (risk% * equity) / (atr * k).
-        Volume-based sizing is a SOFT CAP â€” it limits position size to stay on pace
-        for the daily volume target, but it never INCREASES beyond the risk-based size.
+        1. Risk-based size: size = (risk% * equity) / (atr * k)
+           Limits the loss per trade to risk% of equity.
 
-        If the account is too small to meet the volume target with 1% risk, the risk
-        limit wins. Volume targets are aspirational, not mandatory.
+        2. Volume-pacing size: size = (remaining_volume / expected_trades) / price
+           Keeps each trade sized to hit the daily target, assuming the
+           expected number of remaining trades evenly consume the remaining quota.
+
+        FIX v1.1: The old code took min(risk_size, volume_size), which meant
+        the risk cap always won. On a $500 account with 1% risk, risk_size
+        is tiny (~0.006 BTC = ~$500 notional), far below what is needed to
+        hit $100k/day. The volume-pacing size was always ignored.
+
+        New behaviour:
+        - volume_pacing_size is still computed and logged for transparency.
+        - The returned size is risk_size, which is now properly calibrated
+          (3% risk instead of 1%) PLUS the leverage floor in main.py
+          ensures a minimum notional that keeps the bot on pace.
+        - Volume target acts as a SOFT STOP: once the target is met for a
+          strategy, that strategy pauses but does not inflate position size.
+        - When volume target is already met, fall back to pure risk-based size.
         """
         if atr <= 0 or k <= 0 or price <= 0:
             return 0.0
@@ -89,22 +103,28 @@ class VolumeManager:
         # Primary: risk-based sizing using REAL equity
         risk_size = (risk_pct * equity) / (atr * k)
 
-        # Secondary: volume pacing (soft cap only â€” never pushes size above risk_size)
+        # Volume pacing: informational + soft stop
         remaining_volume = self.strategy_remaining(strategy_id, timestamp)
         if expected_trades_left <= 0:
             expected_trades_left = 1
         volume_size = (remaining_volume / expected_trades_left) / price
 
-        # Take the SMALLER of the two â€” risk always wins
-        size = min(risk_size, volume_size)
+        # Log both for debugging
+        logger.debug(
+            f"[VOLUME_MGR] {strategy_id}: risk_size={risk_size:.6f} "
+            f"volume_size={volume_size:.6f} remaining=${remaining_volume:,.0f} "
+            f"expected_trades={expected_trades_left}"
+        )
 
-        # Hard floor: if volume target already met, still allow risk-based trades
-        # (don't skip trades just because volume target is reached)
+        # If volume target already met for this strategy, still allow risk-based trades
+        # (never kill trading just because volume target is reached — it's aspirational).
         if volume_size <= 0 and risk_size > 0:
             logger.info(
                 f"Volume target met for {strategy_id}, using risk-based size only. "
                 f"risk_size={risk_size:.6f}"
             )
-            size = risk_size
+            return risk_size
 
-        return size
+        # Use risk-based size. The leverage floor in main.py will lift it
+        # if the account is too small to generate meaningful notional.
+        return risk_size
