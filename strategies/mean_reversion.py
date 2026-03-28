@@ -51,8 +51,8 @@ class MeanReversionStrategy:
         lower, mid, upper = bands
         last_close = closes[-1]
 
-        rsi_long_ok = (rsi_val is None) or (rsi_val < 30)
-        rsi_short_ok = (rsi_val is None) or (rsi_val > 70)
+        rsi_long_ok = (rsi_val is None) or (rsi_val < 25)
+        rsi_short_ok = (rsi_val is None) or (rsi_val > 75)
 
         if last_close < lower and last_close < vwap_val and rsi_long_ok:
             stop = last_close - self.config.atr_k * atr_val
