@@ -19,6 +19,15 @@ class StrategyC:
     """
     Strategy C: 3 consecutive candles in same direction on 3m.
     Long on 3 bullish closes, short on 3 bearish closes.
+
+    BUG FIXES applied:
+    - [BUG-1] volumes NameError: variable was used before being defined.
+              Fix: Extract volumes = [c.get("volume", 0.0) for c in last_three]
+              before the increasing-volume check.
+    - [BUG-2] `continue` outside loop (SyntaxError at runtime).
+              Fix: Replace `continue` with `return None` — correct early exit.
+    - [BUG-3] consecutive_required assigned but never used (dead code).
+              Fix: Removed.
     """
 
     strategy_id = "candle3"
@@ -50,16 +59,18 @@ class StrategyC:
             return None
 
         last_three = candles[-3:]
-        consecutive_required = 3
-        require_increasing_volume = True
         first_candle_open = last_three[0]["open"]
         bull = all(c["close"] > c["open"] for c in last_three)
         bear = all(c["close"] < c["open"] for c in last_three)
         last_close = candles[-1]["close"]
 
+        # FIX [BUG-1]: define volumes before use
+        volumes = [c.get("volume", 0.0) for c in last_three]
+        require_increasing_volume = True
         if require_increasing_volume:
-         if not (volumes[-1] > volumes[-2] > volumes[-3]):
-           continue   # Skip — no volume momentum, likely a fake signal
+            # FIX [BUG-2]: was `continue` (invalid outside a loop) — now `return None`
+            if not (volumes[-1] > volumes[-2] > volumes[-3]):
+                return None
 
         if bull:
             return TradeSignal(
