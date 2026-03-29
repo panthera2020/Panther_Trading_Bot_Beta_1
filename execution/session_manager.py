@@ -15,10 +15,44 @@ class SessionPolicy:
 
 class SessionManager:
     def __init__(self) -> None:
+        # FIX v1.1: All sessions now carry a scalp multiplier > 0.
+        # Previously ASIA had no "scalp" key, which caused the scalp condition
+        # (session.strategy_size_mult.get("scalp", 0.0) > 0) to evaluate False
+        # and block all scalp trades during the 8-hour ASIA window.
+        # That killed ~33% of available trading time for the highest-frequency
+        # strategy. Now ASIA uses a 0.5x size multiplier for scalp — smaller
+        # positions, still generating volume overnight.
         self._sessions = [
-            SessionPolicy(name="ASIA", start_hour=0, end_hour=8, strategy_size_mult={"scalp": 0.6, "trend": 0.3}),
-            SessionPolicy(name="LONDON", start_hour=8, end_hour=16, strategy_size_mult={"scalp": 0.8, "trend": 0.6}),
-            SessionPolicy(name="NY", start_hour=16, end_hour=24, strategy_size_mult={"scalp": 1.0, "trend": 1.0}),
+            SessionPolicy(
+                name="ASIA",
+                start_hour=0,
+                end_hour=8,
+                strategy_size_mult={
+                    "scalp": 0.5,   # FIX v1.1: was missing — ASIA now trades scalp
+                    "trend": 0.3,
+                    "candle3": 1.0,
+                },
+            ),
+            SessionPolicy(
+                name="LONDON",
+                start_hour=8,
+                end_hour=16,
+                strategy_size_mult={
+                    "scalp": 0.8,
+                    "trend": 0.6,
+                    "candle3": 0.5,
+                },
+            ),
+            SessionPolicy(
+                name="NY",
+                start_hour=16,
+                end_hour=24,
+                strategy_size_mult={
+                    "scalp": 1.0,
+                    "trend": 1.0,
+                    "candle3": 0.3,
+                },
+            ),
         ]
 
     def current_session(self, timestamp: datetime | None = None) -> SessionPolicy:
