@@ -19,6 +19,7 @@ class StrategyC:
     """
     Strategy C: 3 consecutive candles in same direction on 3m.
     Long on 3 bullish closes, short on 3 bearish closes.
+    Volume confirmation: each of the 3 candles must have increasing volume.
     """
 
     strategy_id = "candle3"
@@ -50,7 +51,6 @@ class StrategyC:
             return None
 
         last_three = candles[-3:]
-        consecutive_required = 3
         require_increasing_volume = True
         first_candle_open = last_three[0]["open"]
         bull = all(c["close"] > c["open"] for c in last_three)
@@ -58,8 +58,10 @@ class StrategyC:
         last_close = candles[-1]["close"]
 
         if require_increasing_volume:
-         if not (volumes[-1] > volumes[-2] > volumes[-3]):
-           continue   # Skip — no volume momentum, likely a fake signal
+            # Extract volume from the last 3 candles; skip signal if volume key absent
+            volumes = [c.get("volume", 0.0) for c in last_three]
+            if not (volumes[2] > volumes[1] > volumes[0]):
+                return None  # No volume momentum — likely a fake signal
 
         if bull:
             return TradeSignal(
