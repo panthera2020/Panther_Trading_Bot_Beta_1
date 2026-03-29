@@ -31,7 +31,7 @@ class BotConfig:
     expected_trades_left: Dict[str, int] = None
     # equity is now a FALLBACK default, not the primary source.
     # The bot fetches real equity from the exchange before every sizing cycle.
-    equity: float = 500.0  # Fallback only â€” real equity is fetched from exchange on startup
+    equity: float = 500.0  # Fallback only — real equity is fetched from exchange on startup
     test_trade_qty: float = 0.001
     test_trade_symbol: str = "BTCUSDT"
     poll_interval_seconds: int = 60
@@ -40,7 +40,7 @@ class BotConfig:
     vol_spike_mult: float = 3.0
     entry_wait_minutes: int = 5
     cooldown_seconds: int = 120
-    # NEW: margin safety buffer â€” require at least 20% free margin after trade
+    # NEW: margin safety buffer — require at least 20% free margin after trade
     margin_safety_pct: float = 0.20
     # NEW: balance cache TTL in seconds (avoid hammering API)
     balance_cache_ttl: float = 15.0
@@ -58,7 +58,8 @@ class TradingBot:
             VolumeConfig(
                 monthly_target=config.monthly_volume_target,
                 trading_days=config.trading_days,
-                strategy_allocations={"trend": 0.25, "scalp": 0.55, "candle3": 0.2},
+                # NOTE: candle3 strategy is DISABLED. Allocation removed.
+                strategy_allocations={"trend": 0.40, "scalp": 0.60},
             )
         )
         # BTC-only for now; add other symbols when ready.
@@ -79,8 +80,9 @@ class TradingBot:
         self._last_sweep = None
         self._last_trade_time: Dict[str, datetime] = {}
         self.last_error: Optional[str] = None
-        self.expected_trades_left = config.expected_trades_left or {"trend": 2, "scalp": 20, "candle3": 30}
-        self.enabled_strategies = {"trend", "scalp", "candle3"}
+        self.expected_trades_left = config.expected_trades_left or {"trend": 2, "scalp": 20}
+        # NOTE: candle3 strategy is DISABLED — removed from enabled_strategies.
+        self.enabled_strategies = {"trend", "scalp"}
         self._strategies_enabled = True
         self._test_trade_in_progress = False
         self._mode = BotMode.IDLE
@@ -90,7 +92,7 @@ class TradingBot:
         self._cached_balance: Dict[str, float] = {}
         self._balance_cache_ts: float = 0.0
 
-    # â”€â”€â”€ LIVE EQUITY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── LIVE EQUITY ────────────────────────────────────────────────────────
 
     def _get_live_equity(self) -> float:
         """
@@ -157,15 +159,17 @@ class TradingBot:
 
         return True
 
-    # â”€â”€â”€ STARTUP / CONTROL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── STARTUP / CONTROL ──────────────────────────────────────────────────
 
     def start(self, strategies: Optional[List[str]] = None, run_test_trade: bool = True) -> None:
         if self.state in {BotState.TERMINATED, BotState.ERROR}:
             return
         if strategies:
-            self.enabled_strategies = set(strategies)
+            # Filter out candle3 even if explicitly passed — it is disabled.
+            self.enabled_strategies = {s for s in strategies if s != "candle3"}
         else:
-            self.enabled_strategies = {"trend", "scalp", "candle3"}
+            # NOTE: candle3 is intentionally excluded.
+            self.enabled_strategies = {"trend", "scalp"}
 
         # Fetch real equity on startup so all sizing uses the actual balance
         startup_equity = self._get_live_equity()
@@ -270,7 +274,7 @@ class TradingBot:
             )
         return merged
 
-    # â”€â”€â”€ POSITION SIZING (FIXED) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── POSITION SIZING (FIXED) ─────────────────────────────────────────────
 
     # Bybit minimum notional value for perpetual orders (USD)
     MIN_NOTIONAL_USD: float = 5.0
@@ -319,7 +323,7 @@ class TradingBot:
 
         return final_size
 
-    # â”€â”€â”€ MARKET DATA HANDLER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── MARKET DATA HANDLER ──────────────────────────────────────────────────
 
     def on_market_data(
         self,
@@ -359,13 +363,7 @@ class TradingBot:
             and session.name in {"LONDON", "NY"}
             and session.strategy_size_mult.get("scalp", 0.0) > 0
         )
-        allow_c = (
-            "candle3" in self.enabled_strategies
-            and session.name == "ASIA"
-            and session.strategy_size_mult.get("scalp", 0.0) > 0
-            # End at London session start (09:00 UTC+1).
-            and self.session_manager.is_within_window(ts, 1, 0, 9, 0, tz_offset_hours=1)
-        )
+        # NOTE: candle3 (allow_c) is DISABLED — block removed entirely.
 
         candles_1h_map = (
             candles_1h if isinstance(candles_1h, dict) else {self.config.test_trade_symbol: candles_1h}
@@ -435,58 +433,6 @@ class TradingBot:
                             self.last_error = str(exc)
                             self.state = BotState.ERROR
                             return
-
-            if allow_c and not self.position_manager.has_open_position(symbol, "candle3"):
-                candles = candles_3m_map.get(symbol, [])
-                atr_val = self._estimate_atr(candles)
-                if atr_val:
-                    price = candles[-1]["close"] if candles else 0.0
-                    signal = self.strategy_c.generate_signal(candles, 1.0, symbol, ts)
-                    if not signal:
-                        continue
-                    risk = abs(signal.price - signal.stop_loss)
-                    if risk <= 0:
-                        continue
-                    # FIXED: Use live equity
-                    live_equity = self._get_live_equity()
-                    size = self.volume_manager.compute_size(
-                        strategy_id="candle3",
-                        risk_pct=self.risk_manager.config.risk_per_trade_pct,
-                        equity=live_equity,  # FIXED: was self.config.equity
-                        atr=risk,
-                        k=1.0,
-                        expected_trades_left=self.expected_trades_left.get("candle3", 1),
-                        price=signal.price,
-                        timestamp=ts,
-                    )
-                    size = self.exchange_client.normalize_qty(symbol, size)
-                    if size <= 0:
-                        continue
-                    # NEW: Pre-trade margin check
-                    if not self._margin_check(signal.price, size, symbol):
-                        continue
-                    signal = TradeSignal(
-                        symbol=signal.symbol,
-                        strategy_id=signal.strategy_id,
-                        side=signal.side,
-                        timestamp=signal.timestamp,
-                        price=signal.price,
-                        stop_loss=signal.stop_loss,
-                        take_profit=signal.take_profit,
-                        size=size,
-                        reason=signal.reason,
-                    )
-                    try:
-                        self.order_manager.execute_signal(signal, ts)
-                        Thread(
-                            target=self._monitor_strategy_c,
-                            args=(symbol, "candle3", 30),
-                            daemon=True,
-                        ).start()
-                    except Exception as exc:  # exchange errors should halt the bot
-                        self.last_error = str(exc)
-                        self.state = BotState.ERROR
-                        return
 
     def _estimate_atr(self, candles: List[Dict[str, float]]) -> Optional[float]:
         if len(candles) < 15:
@@ -682,6 +628,7 @@ class TradingBot:
     def _monitor_strategy_c(self, symbol: str, strategy_id: str, delay_seconds: int) -> None:
         """
         Close after fixed seconds or on stop-loss.
+        NOTE: This method is retained for reference but is not called — candle3 is disabled.
         """
         while True:
             position = self.position_manager.get_position(symbol, strategy_id)
