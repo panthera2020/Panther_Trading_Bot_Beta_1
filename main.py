@@ -31,7 +31,7 @@ class BotConfig:
     expected_trades_left: Dict[str, int] = None
     # equity is now a FALLBACK default, not the primary source.
     # The bot fetches real equity from the exchange before every sizing cycle.
-    equity: float = 500.0  # Fallback only â€” real equity is fetched from exchange on startup
+    equity: float = 500.0  # Fallback only — real equity is fetched from exchange on startup
     test_trade_qty: float = 0.001
     test_trade_symbol: str = "BTCUSDT"
     poll_interval_seconds: int = 60
@@ -40,9 +40,9 @@ class BotConfig:
     vol_spike_mult: float = 3.0
     entry_wait_minutes: int = 5
     cooldown_seconds: int = 120
-    # NEW: margin safety buffer â€” require at least 20% free margin after trade
+    # margin safety buffer — require at least 20% free margin after trade
     margin_safety_pct: float = 0.20
-    # NEW: balance cache TTL in seconds (avoid hammering API)
+    # balance cache TTL in seconds (avoid hammering API)
     balance_cache_ttl: float = 15.0
 
 
@@ -58,7 +58,9 @@ class TradingBot:
             VolumeConfig(
                 monthly_target=config.monthly_volume_target,
                 trading_days=config.trading_days,
-                strategy_allocations={"trend": 0.25, "scalp": 0.55, "candle3": 0.2},
+                # CHANGED: candle3 allocation removed (strategy disabled).
+                # Trend and scalp now share the full volume budget (50/50).
+                strategy_allocations={"trend": 0.50, "scalp": 0.50},
             )
         )
         # BTC-only for now; add other symbols when ready.
@@ -79,18 +81,20 @@ class TradingBot:
         self._last_sweep = None
         self._last_trade_time: Dict[str, datetime] = {}
         self.last_error: Optional[str] = None
-        self.expected_trades_left = config.expected_trades_left or {"trend": 2, "scalp": 20, "candle3": 30}
-        self.enabled_strategies = {"trend", "scalp", "candle3"}
+        # CHANGED: candle3 removed from expected_trades_left (strategy disabled)
+        self.expected_trades_left = config.expected_trades_left or {"trend": 2, "scalp": 20}
+        # CHANGED: candle3 disabled — trend and scalp run in all sessions
+        self.enabled_strategies = {"trend", "scalp"}
         self._strategies_enabled = True
         self._test_trade_in_progress = False
         self._mode = BotMode.IDLE
         self._stop_event = Event()
         self._loop_thread: Optional[Thread] = None
-        # NEW: cached balance data
+        # cached balance data
         self._cached_balance: Dict[str, float] = {}
         self._balance_cache_ts: float = 0.0
 
-    # â”€â”€â”€ LIVE EQUITY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── LIVE EQUITY ────────────────────────────────────────────────
 
     def _get_live_equity(self) -> float:
         """
@@ -157,7 +161,7 @@ class TradingBot:
 
         return True
 
-    # â”€â”€â”€ STARTUP / CONTROL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── STARTUP / CONTROL ──────────────────────────────────────────────────
 
     def start(self, strategies: Optional[List[str]] = None, run_test_trade: bool = True) -> None:
         if self.state in {BotState.TERMINATED, BotState.ERROR}:
@@ -165,7 +169,8 @@ class TradingBot:
         if strategies:
             self.enabled_strategies = set(strategies)
         else:
-            self.enabled_strategies = {"trend", "scalp", "candle3"}
+            # CHANGED: candle3 disabled by default; trend+scalp run all sessions
+            self.enabled_strategies = {"trend", "scalp"}
 
         # Fetch real equity on startup so all sizing uses the actual balance
         startup_equity = self._get_live_equity()
@@ -270,7 +275,7 @@ class TradingBot:
             )
         return merged
 
-    # â”€â”€â”€ POSITION SIZING (FIXED) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── POSITION SIZING (FIXED) ─────────────────────────────────────────
 
     # Bybit minimum notional value for perpetual orders (USD)
     MIN_NOTIONAL_USD: float = 5.0
@@ -283,7 +288,6 @@ class TradingBot:
         k: float,
         timestamp: datetime,
     ) -> float:
-        # FIXED: Use live equity instead of hardcoded config value
         live_equity = self._get_live_equity()
 
         session = self.session_manager.current_session(timestamp)
@@ -291,7 +295,7 @@ class TradingBot:
         base_size = self.volume_manager.compute_size(
             strategy_id=strategy_id,
             risk_pct=self.risk_manager.config.risk_per_trade_pct,
-            equity=live_equity,  # FIXED: was self.config.equity (hardcoded)
+            equity=live_equity,
             atr=atr_value,
             k=k,
             expected_trades_left=self.expected_trades_left.get(strategy_id, 1),
@@ -319,7 +323,7 @@ class TradingBot:
 
         return final_size
 
-    # â”€â”€â”€ MARKET DATA HANDLER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ─── MARKET DATA HANDLER ─────────────────────────────────────────────────
 
     def on_market_data(
         self,
@@ -337,7 +341,6 @@ class TradingBot:
 
         ts = timestamp or datetime.now(timezone.utc)
 
-        # FIXED: _refresh_equity now uses _get_live_equity with caching
         self._refresh_equity()
 
         if not self.risk_manager.can_trade(self.config.equity, ts):
@@ -349,23 +352,20 @@ class TradingBot:
             return
 
         session = self.session_manager.current_session(ts)
+
+        # CHANGED: trend and scalp now run in ALL sessions (ASIA, LONDON, NY).
+        # Session size multipliers still apply for position sizing,
+        # but we no longer gate entry by session name.
         allow_trend = (
             "trend" in self.enabled_strategies
-            and session.name in {"LONDON", "NY"}
             and session.strategy_size_mult.get("trend", 0.0) > 0
         )
         allow_scalp = (
             "scalp" in self.enabled_strategies
-            and session.name in {"LONDON", "NY"}
             and session.strategy_size_mult.get("scalp", 0.0) > 0
         )
-        allow_c = (
-            "candle3" in self.enabled_strategies
-            and session.name == "ASIA"
-            and session.strategy_size_mult.get("scalp", 0.0) > 0
-            # End at London session start (09:00 UTC+1).
-            and self.session_manager.is_within_window(ts, 1, 0, 9, 0, tz_offset_hours=1)
-        )
+        # candle3 disabled — allow_c always False
+        allow_c = False
 
         candles_1h_map = (
             candles_1h if isinstance(candles_1h, dict) else {self.config.test_trade_symbol: candles_1h}
@@ -403,14 +403,13 @@ class TradingBot:
                         size = self.exchange_client.normalize_qty(symbol, size)
                         if size <= 0:
                             continue
-                        # NEW: Pre-trade margin check
                         if not self._margin_check(price, size, symbol):
                             continue
                         signal = self.trend_strategy.generate_signal(candles, size, symbol, ts)
                         if signal:
                             try:
                                 self.order_manager.execute_signal(signal, ts)
-                            except Exception as exc:  # exchange errors should halt the bot
+                            except Exception as exc:
                                 self.last_error = str(exc)
                                 self.state = BotState.ERROR
                                 return
@@ -424,69 +423,18 @@ class TradingBot:
                     size = self.exchange_client.normalize_qty(symbol, size)
                     if size <= 0:
                         continue
-                    # NEW: Pre-trade margin check
                     if not self._margin_check(price, size, symbol):
                         continue
                     signal = self.scalp_strategy.generate_signal(candles, size, symbol, ts)
                     if signal:
                         try:
                             self.order_manager.execute_signal(signal, ts)
-                        except Exception as exc:  # exchange errors should halt the bot
+                        except Exception as exc:
                             self.last_error = str(exc)
                             self.state = BotState.ERROR
                             return
 
-            if allow_c and not self.position_manager.has_open_position(symbol, "candle3"):
-                candles = candles_3m_map.get(symbol, [])
-                atr_val = self._estimate_atr(candles)
-                if atr_val:
-                    price = candles[-1]["close"] if candles else 0.0
-                    signal = self.strategy_c.generate_signal(candles, 1.0, symbol, ts)
-                    if not signal:
-                        continue
-                    risk = abs(signal.price - signal.stop_loss)
-                    if risk <= 0:
-                        continue
-                    # FIXED: Use live equity
-                    live_equity = self._get_live_equity()
-                    size = self.volume_manager.compute_size(
-                        strategy_id="candle3",
-                        risk_pct=self.risk_manager.config.risk_per_trade_pct,
-                        equity=live_equity,  # FIXED: was self.config.equity
-                        atr=risk,
-                        k=1.0,
-                        expected_trades_left=self.expected_trades_left.get("candle3", 1),
-                        price=signal.price,
-                        timestamp=ts,
-                    )
-                    size = self.exchange_client.normalize_qty(symbol, size)
-                    if size <= 0:
-                        continue
-                    # NEW: Pre-trade margin check
-                    if not self._margin_check(signal.price, size, symbol):
-                        continue
-                    signal = TradeSignal(
-                        symbol=signal.symbol,
-                        strategy_id=signal.strategy_id,
-                        side=signal.side,
-                        timestamp=signal.timestamp,
-                        price=signal.price,
-                        stop_loss=signal.stop_loss,
-                        take_profit=signal.take_profit,
-                        size=size,
-                        reason=signal.reason,
-                    )
-                    try:
-                        self.order_manager.execute_signal(signal, ts)
-                        Thread(
-                            target=self._monitor_strategy_c,
-                            args=(symbol, "candle3", 30),
-                            daemon=True,
-                        ).start()
-                    except Exception as exc:  # exchange errors should halt the bot
-                        self.last_error = str(exc)
-                        self.state = BotState.ERROR
-                        return
+            # candle3 block intentionally omitted — strategy is disabled.
 
     def _estimate_atr(self, candles: List[Dict[str, float]]) -> Optional[float]:
         if len(candles) < 15:
@@ -582,12 +530,11 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: invalid risk. symbol={symbol}")
             return
 
-        # FIXED: Use live equity
         live_equity = self._get_live_equity()
         size = self.volume_manager.compute_size(
             strategy_id="trend",
             risk_pct=self.risk_manager.config.risk_per_trade_pct,
-            equity=live_equity,  # FIXED: was self.config.equity
+            equity=live_equity,
             atr=risk,
             k=1.0,
             expected_trades_left=self.expected_trades_left.get("trend", 1),
@@ -598,7 +545,6 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: size below min. symbol={symbol}")
             return
 
-        # Min notional check for hybrid
         notional = size * entry_price
         if notional < self.MIN_NOTIONAL_USD:
             logger.warning(
@@ -607,7 +553,6 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: notional too small. symbol={symbol}")
             return
 
-        # NEW: Pre-trade margin check
         if not self._margin_check(entry_price, size, symbol):
             return
 
@@ -682,6 +627,7 @@ class TradingBot:
     def _monitor_strategy_c(self, symbol: str, strategy_id: str, delay_seconds: int) -> None:
         """
         Close after fixed seconds or on stop-loss.
+        (Retained for reference — strategy_c is currently disabled.)
         """
         while True:
             position = self.position_manager.get_position(symbol, strategy_id)
@@ -699,14 +645,12 @@ class TradingBot:
                     return
             except Exception as exc:
                 self.last_error = str(exc)
-                # Continue to enforce time-based close even if price fetch fails.
             now = datetime.now(timezone.utc)
             sleep_seconds = max((target_close_time - now).total_seconds(), 0.0)
             if sleep_seconds <= 0:
                 break
             sleep(min(sleep_seconds, 1.0))
 
-        # Hard close after fixed timer, with a few retries.
         for _ in range(3):
             try:
                 try:
@@ -748,7 +692,6 @@ class TradingBot:
                         datetime.now(timezone.utc),
                     )
                 except Exception as exc:
-                    # Network/exchange hiccups: keep bot running and retry after 2 minutes.
                     self.last_error = str(exc)
                     self._mode = BotMode.IDLE
                     sleep(120)
