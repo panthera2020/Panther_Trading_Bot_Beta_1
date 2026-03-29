@@ -17,6 +17,7 @@ class MeanReversionConfig:
     atr_k: float = 1.5
     max_holding_bars: int = 12
     use_rsi: bool = True
+    rr_ratio: float = 2.0  # TP = entry +/- rr_ratio * risk (enforced min 2R)
 
 
 class MeanReversionStrategy:
@@ -57,7 +58,8 @@ class MeanReversionStrategy:
         if last_close < lower and last_close < vwap_val and rsi_long_ok:
             stop = last_close - self.config.atr_k * atr_val
             risk = abs(last_close - stop)
-            take_profit = last_close + 2 * risk
+            # Enforce minimum rr_ratio:1 RR
+            take_profit = last_close + max(self.config.rr_ratio, 2.0) * risk
             return TradeSignal(
                 symbol=symbol,
                 strategy_id=self.strategy_id,
@@ -74,7 +76,8 @@ class MeanReversionStrategy:
         if last_close > upper and last_close > vwap_val and rsi_short_ok:
             stop = last_close + self.config.atr_k * atr_val
             risk = abs(stop - last_close)
-            take_profit = last_close - 2 * risk
+            # Enforce minimum rr_ratio:1 RR
+            take_profit = last_close - max(self.config.rr_ratio, 2.0) * risk
             return TradeSignal(
                 symbol=symbol,
                 strategy_id=self.strategy_id,
