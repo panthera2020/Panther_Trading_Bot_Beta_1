@@ -15,9 +15,10 @@ class TrendBreakoutConfig:
     ema_slow: int = 200
     atr_period: int = 14
     volume_sma: int = 20
-    atr_k: float = 2.0
+    atr_k: float = 2.0       # SL distance in ATR multiples
     trail_atr_k: float = 1.5
     min_ema_gap: float = 0.005
+    rr_ratio: float = 2.0    # TP = entry +/- rr_ratio * risk (was effectively 1:1, now 2:1)
 
 
 class TrendBreakoutStrategy:
@@ -61,7 +62,9 @@ class TrendBreakoutStrategy:
 
         if ema_fast_val > ema_slow_val and last_close > recent_high and volume_ok:
             stop = last_close - self.config.atr_k * atr_val
-            take_profit = last_close + self.config.atr_k * atr_val
+            risk = abs(last_close - stop)
+            # FIX: TP was last_close + atr_k * atr_val (1:1 RR). Now rr_ratio * risk (min 2:1).
+            take_profit = last_close + self.config.rr_ratio * risk
             return TradeSignal(
                 symbol=symbol,
                 strategy_id=self.strategy_id,
@@ -77,7 +80,9 @@ class TrendBreakoutStrategy:
 
         if ema_fast_val < ema_slow_val and last_close < recent_low and volume_ok:
             stop = last_close + self.config.atr_k * atr_val
-            take_profit = last_close - self.config.atr_k * atr_val
+            risk = abs(stop - last_close)
+            # FIX: TP was last_close - atr_k * atr_val (1:1 RR). Now rr_ratio * risk (min 2:1).
+            take_profit = last_close - self.config.rr_ratio * risk
             return TradeSignal(
                 symbol=symbol,
                 strategy_id=self.strategy_id,
