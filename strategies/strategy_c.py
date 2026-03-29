@@ -13,13 +13,13 @@ class StrategyCConfig:
     atr_period: int = 14
     min_atr: float | None = None
     max_atr: float | None = None
+    require_increasing_volume: bool = True
 
 
 class StrategyC:
     """
     Strategy C: 3 consecutive candles in same direction on 3m.
     Long on 3 bullish closes, short on 3 bearish closes.
-    Volume confirmation: each of the 3 candles must have increasing volume.
     """
 
     strategy_id = "candle3"
@@ -51,17 +51,21 @@ class StrategyC:
             return None
 
         last_three = candles[-3:]
-        require_increasing_volume = True
         first_candle_open = last_three[0]["open"]
-        bull = all(c["close"] > c["open"] for c in last_three)
-        bear = all(c["close"] < c["open"] for c in last_three)
         last_close = candles[-1]["close"]
 
-        if require_increasing_volume:
-            # Extract volume from the last 3 candles; skip signal if volume key absent
-            volumes = [c.get("volume", 0.0) for c in last_three]
-            if not (volumes[2] > volumes[1] > volumes[0]):
-                return None  # No volume momentum — likely a fake signal
+        bull = all(c["close"] > c["open"] for c in last_three)
+        bear = all(c["close"] < c["open"] for c in last_three)
+
+        if not bull and not bear:
+            return None
+
+        # FIX: Extract volumes from candles (was referencing undefined 'volumes')
+        # FIX: Use 'return None' instead of 'continue' (not inside a loop)
+        if self.config.require_increasing_volume:
+            volumes = [c["volume"] for c in candles]
+            if not (volumes[-1] > volumes[-2] > volumes[-3]):
+                return None  # No volume momentum, likely a fake signal
 
         if bull:
             return TradeSignal(

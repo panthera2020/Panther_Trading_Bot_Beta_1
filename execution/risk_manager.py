@@ -6,10 +6,12 @@ from datetime import datetime, timezone
 
 @dataclass
 class RiskConfig:
-    max_daily_loss_pct: float = 0.05      # FIX v1.1: 3% → 5% (more headroom for volume bots)
-    max_consecutive_losses: int = 5        # FIX v1.1: 3 → 5 (less trigger-happy pause)
-    max_orders_per_hour: int = 100         # FIX v1.1: 20 → 100 (unthrottles scalp/candle3)
-    risk_per_trade_pct: float = 0.03       # FIX v1.1: 1% → 3% (more notional per trade)
+    max_daily_loss_pct: float = 0.03
+    max_consecutive_losses: int = 3
+    max_orders_per_hour: int = 20
+    # Risk per trade as a fraction of equity. Valid range: 0.01–0.03 (1%–3%).
+    # Default is 2% (0.02). Adjust to 0.01 for conservative or 0.03 for aggressive sizing.
+    risk_per_trade_pct: float = 0.02  # 2% of equity per trade (range: 1%–3%)
 
 
 class RiskManager:
