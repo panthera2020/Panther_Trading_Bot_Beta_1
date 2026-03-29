@@ -13,6 +13,7 @@ class StrategyCConfig:
     atr_period: int = 14
     min_atr: float | None = None
     max_atr: float | None = None
+    require_increasing_volume: bool = True
 
 
 class StrategyC:
@@ -50,16 +51,21 @@ class StrategyC:
             return None
 
         last_three = candles[-3:]
-        consecutive_required = 3
-        require_increasing_volume = True
         first_candle_open = last_three[0]["open"]
-        bull = all(c["close"] > c["open"] for c in last_three)
-        bear = all(c["close"] < c["open"] for c in last_three)
         last_close = candles[-1]["close"]
 
-        if require_increasing_volume:
-         if not (volumes[-1] > volumes[-2] > volumes[-3]):
-           continue   # Skip — no volume momentum, likely a fake signal
+        bull = all(c["close"] > c["open"] for c in last_three)
+        bear = all(c["close"] < c["open"] for c in last_three)
+
+        if not bull and not bear:
+            return None
+
+        # FIX: Extract volumes from candles (was referencing undefined 'volumes')
+        # FIX: Use 'return None' instead of 'continue' (not inside a loop)
+        if self.config.require_increasing_volume:
+            volumes = [c["volume"] for c in candles]
+            if not (volumes[-1] > volumes[-2] > volumes[-3]):
+                return None  # No volume momentum, likely a fake signal
 
         if bull:
             return TradeSignal(
