@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BotConfig:
     symbols: List[str] = None
-    monthly_volume_target: float = 2_000_000.0  # UPDATED: reduced from $3M to $2M/month
+    monthly_volume_target: float = 3_000_000.0
     trading_days: int = 30
     expected_trades_left: Dict[str, int] = None
     # equity is now a FALLBACK default, not the primary source.
@@ -58,7 +58,9 @@ class TradingBot:
             VolumeConfig(
                 monthly_target=config.monthly_volume_target,
                 trading_days=config.trading_days,
-                strategy_allocations={"trend": 0.25, "scalp": 0.55, "candle3": 0.2},
+                # CHANGED: candle3 allocation removed (strategy disabled).
+                # Trend and scalp now share the full volume budget (50/50).
+                strategy_allocations={"trend": 0.50, "scalp": 0.50},
             )
         )
         # BTC-only for now; add other symbols when ready.
@@ -79,8 +81,10 @@ class TradingBot:
         self._last_sweep = None
         self._last_trade_time: Dict[str, datetime] = {}
         self.last_error: Optional[str] = None
-        self.expected_trades_left = config.expected_trades_left or {"trend": 2, "scalp": 20, "candle3": 30}
-        self.enabled_strategies = {"trend", "scalp", "candle3"}
+        # CHANGED: candle3 removed from expected_trades_left (strategy disabled)
+        self.expected_trades_left = config.expected_trades_left or {"trend": 2, "scalp": 20}
+        # CHANGED: candle3 disabled — trend and scalp run in all sessions
+        self.enabled_strategies = {"trend", "scalp"}
         self._strategies_enabled = True
         self._test_trade_in_progress = False
         self._mode = BotMode.IDLE
@@ -90,19 +94,25 @@ class TradingBot:
         self._cached_balance: Dict[str, float] = {}
         self._balance_cache_ts: float = 0.0
 
-    # --- LIVE EQUITY ------------------------------------------------
+    # ─── LIVE EQUITY ────────────────────────────────────────────────
 
     def _get_live_equity(self) -> float:
+        """
+        Return the real account equity from the exchange, with a short cache
+        to avoid hammering the API on every sizing call within the same poll.
+        Falls back to config.equity if the API call fails.
+        """
         now = _time()
         if self._cached_balance and (now - self._balance_cache_ts) < self.config.balance_cache_ttl:
             return float(self._cached_balance.get("total_equity", self.config.equity) or self.config.equity)
+
         try:
             balance = self.exchange_client.get_balance()
             equity = float(balance.get("total_equity", 0.0) or 0.0)
             if equity > 0:
                 self._cached_balance = balance
                 self._balance_cache_ts = now
-                self.config.equity = equity
+                self.config.equity = equity  # keep config in sync for status display
                 return equity
             else:
                 logger.warning("Exchange returned zero equity, using cached/config value")
@@ -113,19 +123,30 @@ class TradingBot:
             return self.config.equity
 
     def _get_available_margin(self) -> float:
-        self._get_live_equity()
+        """Return the available margin from the last balance fetch."""
+        self._get_live_equity()  # ensure cache is fresh
         return float(self._cached_balance.get("available_balance", 0.0) or 0.0)
 
     def _margin_check(self, price: float, qty: float, symbol: str) -> bool:
+        """
+        Pre-trade margin validation.
+        Ensure the notional value of the position doesn't exceed available margin
+        minus a safety buffer. This prevents the bot from sending orders that
+        Bybit will reject with insufficient balance.
+        """
         available = self._get_available_margin()
         if available <= 0:
             logger.warning(f"No available margin. symbol={symbol}")
             self.order_manager.log_event("WARN", f"No available margin. symbol={symbol}")
             return False
+
         notional = price * qty
+        # With leverage, the required margin is notional / leverage
         leverage = getattr(getattr(self.exchange_client, 'config', None), 'leverage', 50)
         required_margin = notional / leverage
+        # Keep a safety buffer
         max_margin = available * (1.0 - self.config.margin_safety_pct)
+
         if required_margin > max_margin:
             logger.warning(
                 f"Margin check FAILED. symbol={symbol} "
@@ -137,9 +158,10 @@ class TradingBot:
                 f"Margin check failed: need ${required_margin:.2f} but only ${max_margin:.2f} available. symbol={symbol}",
             )
             return False
+
         return True
 
-    # --- STARTUP / CONTROL ------------------------------------------
+    # ─── STARTUP / CONTROL ──────────────────────────────────────────────────
 
     def start(self, strategies: Optional[List[str]] = None, run_test_trade: bool = True) -> None:
         if self.state in {BotState.TERMINATED, BotState.ERROR}:
@@ -147,7 +169,10 @@ class TradingBot:
         if strategies:
             self.enabled_strategies = set(strategies)
         else:
-            self.enabled_strategies = {"trend", "scalp", "candle3"}
+            # CHANGED: candle3 disabled by default; trend+scalp run all sessions
+            self.enabled_strategies = {"trend", "scalp"}
+
+        # Fetch real equity on startup so all sizing uses the actual balance
         startup_equity = self._get_live_equity()
         risk_pct = self.risk_manager.config.risk_per_trade_pct
         risk_per_trade = risk_pct * startup_equity
@@ -161,6 +186,7 @@ class TradingBot:
                 f"Very low equity (${startup_equity:,.2f}). "
                 f"Some trades may be skipped if position size is below exchange minimums."
             )
+
         if run_test_trade:
             self._strategies_enabled = False
             self._test_trade_in_progress = True
@@ -249,8 +275,9 @@ class TradingBot:
             )
         return merged
 
-    # --- POSITION SIZING -------------------------------------------
+    # ─── POSITION SIZING (FIXED) ─────────────────────────────────────────
 
+    # Bybit minimum notional value for perpetual orders (USD)
     MIN_NOTIONAL_USD: float = 5.0
 
     def _size_for_strategy(
@@ -262,6 +289,7 @@ class TradingBot:
         timestamp: datetime,
     ) -> float:
         live_equity = self._get_live_equity()
+
         session = self.session_manager.current_session(timestamp)
         size_mult = session.strategy_size_mult.get(strategy_id, 1.0)
         base_size = self.volume_manager.compute_size(
@@ -275,6 +303,8 @@ class TradingBot:
             timestamp=timestamp,
         )
         final_size = base_size * size_mult
+
+        # Log sizing details for debugging small accounts
         notional = final_size * price if price > 0 else 0.0
         risk_dollar = self.risk_manager.config.risk_per_trade_pct * live_equity
         logger.debug(
@@ -282,15 +312,18 @@ class TradingBot:
             f"risk=${risk_dollar:,.2f} atr={atr_value:.2f} "
             f"size={final_size:.6f} notional=${notional:,.2f}"
         )
+
+        # Skip if notional is below exchange minimum
         if notional < self.MIN_NOTIONAL_USD:
             logger.warning(
                 f"Notional ${notional:.2f} below minimum ${self.MIN_NOTIONAL_USD:.2f} "
                 f"for {strategy_id}. equity=${live_equity:,.2f}. Skipping trade."
             )
             return 0.0
+
         return final_size
 
-    # --- MARKET DATA HANDLER ----------------------------------------
+    # ─── MARKET DATA HANDLER ─────────────────────────────────────────────────
 
     def on_market_data(
         self,
@@ -305,29 +338,35 @@ class TradingBot:
             return
         if self._test_trade_in_progress or not self._strategies_enabled:
             return
+
         ts = timestamp or datetime.now(timezone.utc)
+
         self._refresh_equity()
+
         if not self.risk_manager.can_trade(self.config.equity, ts):
             return
+
+        # Global single-position rule: do not open new trades
+        # until all positions are closed (any strategy).
         if self.position_manager.open_positions_count() > 0:
             return
+
         session = self.session_manager.current_session(ts)
+
+        # CHANGED: trend and scalp now run in ALL sessions (ASIA, LONDON, NY).
+        # Session size multipliers still apply for position sizing,
+        # but we no longer gate entry by session name.
         allow_trend = (
             "trend" in self.enabled_strategies
-            and session.name in {"LONDON", "NY"}
             and session.strategy_size_mult.get("trend", 0.0) > 0
         )
         allow_scalp = (
             "scalp" in self.enabled_strategies
-            and session.name in {"LONDON", "NY"}
             and session.strategy_size_mult.get("scalp", 0.0) > 0
         )
-        allow_c = (
-            "candle3" in self.enabled_strategies
-            and session.name == "ASIA"
-            and session.strategy_size_mult.get("scalp", 0.0) > 0
-            and self.session_manager.is_within_window(ts, 1, 0, 9, 0, tz_offset_hours=1)
-        )
+        # candle3 disabled — allow_c always False
+        allow_c = False
+
         candles_1h_map = (
             candles_1h if isinstance(candles_1h, dict) else {self.config.test_trade_symbol: candles_1h}
         )
@@ -343,6 +382,7 @@ class TradingBot:
         candles_1m_map = (
             candles_1m if isinstance(candles_1m, dict) else {self.config.test_trade_symbol: candles_1m}
         )
+
         for symbol in self.symbols:
             self._apply_breakeven(symbol, ts)
             if allow_trend and not self.position_manager.has_open_position(symbol, "trend"):
@@ -373,6 +413,7 @@ class TradingBot:
                                 self.last_error = str(exc)
                                 self.state = BotState.ERROR
                                 return
+
             if allow_scalp and not self.position_manager.has_open_position(symbol, "scalp"):
                 candles = candles_5m_map.get(symbol, [])
                 atr_val = self._estimate_atr(candles)
@@ -392,55 +433,8 @@ class TradingBot:
                             self.last_error = str(exc)
                             self.state = BotState.ERROR
                             return
-            if allow_c and not self.position_manager.has_open_position(symbol, "candle3"):
-                candles = candles_3m_map.get(symbol, [])
-                atr_val = self._estimate_atr(candles)
-                if atr_val:
-                    price = candles[-1]["close"] if candles else 0.0
-                    signal = self.strategy_c.generate_signal(candles, 1.0, symbol, ts)
-                    if not signal:
-                        continue
-                    risk = abs(signal.price - signal.stop_loss)
-                    if risk <= 0:
-                        continue
-                    live_equity = self._get_live_equity()
-                    size = self.volume_manager.compute_size(
-                        strategy_id="candle3",
-                        risk_pct=self.risk_manager.config.risk_per_trade_pct,
-                        equity=live_equity,
-                        atr=risk,
-                        k=1.0,
-                        expected_trades_left=self.expected_trades_left.get("candle3", 1),
-                        price=signal.price,
-                        timestamp=ts,
-                    )
-                    size = self.exchange_client.normalize_qty(symbol, size)
-                    if size <= 0:
-                        continue
-                    if not self._margin_check(signal.price, size, symbol):
-                        continue
-                    signal = TradeSignal(
-                        symbol=signal.symbol,
-                        strategy_id=signal.strategy_id,
-                        side=signal.side,
-                        timestamp=signal.timestamp,
-                        price=signal.price,
-                        stop_loss=signal.stop_loss,
-                        take_profit=signal.take_profit,
-                        size=size,
-                        reason=signal.reason,
-                    )
-                    try:
-                        self.order_manager.execute_signal(signal, ts)
-                        Thread(
-                            target=self._monitor_strategy_c,
-                            args=(symbol, "candle3", 30),
-                            daemon=True,
-                        ).start()
-                    except Exception as exc:
-                        self.last_error = str(exc)
-                        self.state = BotState.ERROR
-                        return
+
+            # candle3 block intentionally omitted — strategy is disabled.
 
     def _estimate_atr(self, candles: List[Dict[str, float]]) -> Optional[float]:
         if len(candles) < 15:
@@ -455,6 +449,7 @@ class TradingBot:
         return sum(trs) / 14
 
     def _refresh_equity(self) -> None:
+        """Refresh equity using the cached live balance fetcher."""
         equity = self._get_live_equity()
         logger.debug(f"Equity refreshed: ${equity:,.2f}")
 
@@ -490,41 +485,51 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: no bias. symbol={symbol}")
             self._last_sweep = None
             return
+
         sweep = self.sweep_detector.detect(candles_15m, bias)
         if sweep:
             self._last_sweep = sweep
             self.order_manager.log_event("INFO", f"Hybrid: sweep detected {sweep.direction}. symbol={symbol}")
+
         if not self._last_sweep:
             return
+
         if self._last_sweep.direction != bias:
             self.order_manager.log_event("INFO", f"Hybrid: bias flipped. symbol={symbol}")
             self._last_sweep = None
             return
+
         last_trade = self._last_trade_time.get("trend")
         if last_trade and (ts - last_trade).total_seconds() < self.config.cooldown_seconds:
             self.order_manager.log_event("INFO", f"Hybrid: cooldown active. symbol={symbol}")
             return
+
         if not self.entry_executor.should_enter(self._last_sweep, candles_1m, bias):
             self.order_manager.log_event("INFO", f"Hybrid: no 1m entry. symbol={symbol}")
             return
+
         if not candles_1m:
             self.order_manager.log_event("INFO", f"Hybrid: no 1m candles. symbol={symbol}")
             return
+
         last = candles_1m[-1]
         spread_proxy = abs(last["high"] - last["low"])
         if spread_proxy > self.config.max_spread:
             self.order_manager.log_event("INFO", f"Hybrid: spread too high. symbol={symbol}")
             return
+
         atr_val = atr_1m(candles_1m)
         if atr_val is not None and spread_proxy > (atr_val * self.config.vol_spike_mult):
             self.order_manager.log_event("INFO", f"Hybrid: volatility spike. symbol={symbol}")
             return
+
         entry_price = last["close"]
         stop_loss = self._last_sweep.level
         risk = abs(entry_price - stop_loss)
         if risk <= 0:
             self.order_manager.log_event("INFO", f"Hybrid: invalid risk. symbol={symbol}")
             return
+
         live_equity = self._get_live_equity()
         size = self.volume_manager.compute_size(
             strategy_id="trend",
@@ -539,19 +544,25 @@ class TradingBot:
         if size <= 0:
             self.order_manager.log_event("INFO", f"Hybrid: size below min. symbol={symbol}")
             return
+
         notional = size * entry_price
         if notional < self.MIN_NOTIONAL_USD:
-            logger.warning(f"Hybrid: notional ${notional:.2f} below min ${self.MIN_NOTIONAL_USD:.2f}. Skipping.")
+            logger.warning(
+                f"Hybrid: notional ${notional:.2f} below min ${self.MIN_NOTIONAL_USD:.2f}. Skipping."
+            )
             self.order_manager.log_event("INFO", f"Hybrid: notional too small. symbol={symbol}")
             return
+
         if not self._margin_check(entry_price, size, symbol):
             return
+
         if bias == "LONG":
             take_profit = entry_price + 2 * risk
             side = Side.BUY
         else:
             take_profit = entry_price - 2 * risk
             side = Side.SELL
+
         signal = TradeSignal(
             symbol=symbol,
             strategy_id="trend",
@@ -614,6 +625,10 @@ class TradingBot:
                 self._mode = BotMode.SCANNING
 
     def _monitor_strategy_c(self, symbol: str, strategy_id: str, delay_seconds: int) -> None:
+        """
+        Close after fixed seconds or on stop-loss.
+        (Retained for reference — strategy_c is currently disabled.)
+        """
         while True:
             position = self.position_manager.get_position(symbol, strategy_id)
             if not position:
@@ -635,6 +650,7 @@ class TradingBot:
             if sleep_seconds <= 0:
                 break
             sleep(min(sleep_seconds, 1.0))
+
         for _ in range(3):
             try:
                 try:
