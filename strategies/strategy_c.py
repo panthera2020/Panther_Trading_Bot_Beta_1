@@ -13,13 +13,15 @@ class StrategyCConfig:
     atr_period: int = 14
     min_atr: float | None = None
     max_atr: float | None = None
+    rr_ratio: float = 1.5  # Minimum reward-to-risk ratio (take_profit = rr_ratio * risk)
 
 
 class StrategyC:
     """
     Strategy C: 3 consecutive candles in same direction on 3m.
     Long on 3 bullish closes, short on 3 bearish closes.
-    Volume momentum filter: last 3 candles must have increasing volume.
+    Requires increasing volume across the three candles (momentum confirmation).
+    Take-profit is set at rr_ratio * risk from entry (default 1:1.5).
     """
 
     strategy_id = "candle3"
@@ -51,42 +53,54 @@ class StrategyC:
             return None
 
         last_three = candles[-3:]
-        require_increasing_volume = True
         first_candle_open = last_three[0]["open"]
-        bull = all(c["close"] > c["open"] for c in last_three)
-        bear = all(c["close"] < c["open"] for c in last_three)
         last_close = candles[-1]["close"]
 
-        if require_increasing_volume:
-            # Build volume list from candle dicts; use 0.0 as fallback if key absent
-            volumes = [c.get("volume", 0.0) for c in last_three]
+        bull = all(c["close"] > c["open"] for c in last_three)
+        bear = all(c["close"] < c["open"] for c in last_three)
+
+        if not bull and not bear:
+            return None
+
+        # --- Volume momentum confirmation ---
+        # Extract volumes from the three candles.
+        # Candle dicts are expected to have a 'volume' key.
+        # If volume data is unavailable (all zeros), skip the check rather than blocking every signal.
+        volumes = [c.get("volume", 0.0) for c in last_three]
+        has_volume_data = any(v > 0 for v in volumes)
+        if has_volume_data:
             if not (volumes[2] > volumes[1] > volumes[0]):
-                return None  # No volume momentum — skip signal
+                # No volume momentum — likely a fake/low-conviction signal, skip it.
+                return None
+
+        # --- Risk calculation ---
+        # Stop-loss anchor: first candle open (the origin of the three-candle move).
+        risk = abs(last_close - first_candle_open)
+        if risk <= 0:
+            return None
+
+        # Take-profit at rr_ratio * risk from entry (default 1:1.5)
+        tp_distance = self.config.rr_ratio * risk
 
         if bull:
-            return TradeSignal(
-                symbol=symbol,
-                strategy_id=self.strategy_id,
-                side=Side.BUY,
-                timestamp=timestamp,
-                price=last_close,
-                stop_loss=first_candle_open,
-                take_profit=None,
-                size=size,
-                reason="three_bullish_3m",
-            )
+            stop_loss = first_candle_open
+            take_profit = last_close + tp_distance
+            side = Side.BUY
+            reason = "three_bullish_3m"
+        else:
+            stop_loss = first_candle_open
+            take_profit = last_close - tp_distance
+            side = Side.SELL
+            reason = "three_bearish_3m"
 
-        if bear:
-            return TradeSignal(
-                symbol=symbol,
-                strategy_id=self.strategy_id,
-                side=Side.SELL,
-                timestamp=timestamp,
-                price=last_close,
-                stop_loss=first_candle_open,
-                take_profit=None,
-                size=size,
-                reason="three_bearish_3m",
-            )
-
-        return None
+        return TradeSignal(
+            symbol=symbol,
+            strategy_id=self.strategy_id,
+            side=side,
+            timestamp=timestamp,
+            price=last_close,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            size=size,
+            reason=reason,
+        )

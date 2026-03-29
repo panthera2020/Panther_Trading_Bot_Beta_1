@@ -25,13 +25,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BotConfig:
-    symbols: list = None
-    monthly_volume_target: float = 3_000_000.0
+    symbols: List[str] = None
+    monthly_volume_target: float = 2_000_000.0  # Reduced from 3M to 2M per spec
     trading_days: int = 30
-    expected_trades_left: dict = None
+    expected_trades_left: Dict[str, int] = None
     # equity is now a FALLBACK default, not the primary source.
     # The bot fetches real equity from the exchange before every sizing cycle.
-    equity: float = 500.0  # Fallback only — real equity is fetched from exchange on startup
+    equity: float = 500.0  # Fallback only - real equity is fetched from exchange on startup
     test_trade_qty: float = 0.001
     test_trade_symbol: str = "BTCUSDT"
     poll_interval_seconds: int = 60
@@ -40,9 +40,9 @@ class BotConfig:
     vol_spike_mult: float = 3.0
     entry_wait_minutes: int = 5
     cooldown_seconds: int = 120
-    # NEW: margin safety buffer — require at least 20% free margin after trade
+    # margin safety buffer - require at least 20% free margin after trade
     margin_safety_pct: float = 0.20
-    # NEW: balance cache TTL in seconds (avoid hammering API)
+    # balance cache TTL in seconds (avoid hammering API)
     balance_cache_ttl: float = 15.0
 
 
@@ -86,11 +86,11 @@ class TradingBot:
         self._mode = BotMode.IDLE
         self._stop_event = Event()
         self._loop_thread: Optional[Thread] = None
-        # NEW: cached balance data
+        # cached balance data
         self._cached_balance: Dict[str, float] = {}
         self._balance_cache_ts: float = 0.0
 
-    # ─── LIVE EQUITY ────────────────────────────────────────────────────────────
+    # --- LIVE EQUITY ------------------------------------------------
 
     def _get_live_equity(self) -> float:
         """
@@ -157,7 +157,7 @@ class TradingBot:
 
         return True
 
-    # ─── STARTUP / CONTROL ──────────────────────────────────────────────────────
+    # --- STARTUP / CONTROL ------------------------------------------
 
     def start(self, strategies: Optional[List[str]] = None, run_test_trade: bool = True) -> None:
         if self.state in {BotState.TERMINATED, BotState.ERROR}:
@@ -270,7 +270,7 @@ class TradingBot:
             )
         return merged
 
-    # ─── POSITION SIZING (FIXED) ─────────────────────────────────────────────────
+    # --- POSITION SIZING (FIXED) ------------------------------------
 
     # Bybit minimum notional value for perpetual orders (USD)
     MIN_NOTIONAL_USD: float = 5.0
@@ -319,7 +319,7 @@ class TradingBot:
 
         return final_size
 
-    # ─── MARKET DATA HANDLER ────────────────────────────────────────────────────
+    # --- MARKET DATA HANDLER ----------------------------------------
 
     def on_market_data(
         self,
@@ -337,7 +337,6 @@ class TradingBot:
 
         ts = timestamp or datetime.now(timezone.utc)
 
-        # FIXED: _refresh_equity now uses _get_live_equity with caching
         self._refresh_equity()
 
         if not self.risk_manager.can_trade(self.config.equity, ts):
@@ -403,14 +402,14 @@ class TradingBot:
                         size = self.exchange_client.normalize_qty(symbol, size)
                         if size <= 0:
                             continue
-                        # NEW: Pre-trade margin check
                         if not self._margin_check(price, size, symbol):
                             continue
                         signal = self.trend_strategy.generate_signal(candles, size, symbol, ts)
                         if signal:
                             try:
                                 self.order_manager.execute_signal(signal, ts)
-                            except Exception as exc:  # exchange errors should halt the bot
+                                self._last_trade_time["trend"] = ts
+                            except Exception as exc:
                                 self.last_error = str(exc)
                                 self.state = BotState.ERROR
                                 return
@@ -424,14 +423,14 @@ class TradingBot:
                     size = self.exchange_client.normalize_qty(symbol, size)
                     if size <= 0:
                         continue
-                    # NEW: Pre-trade margin check
                     if not self._margin_check(price, size, symbol):
                         continue
                     signal = self.scalp_strategy.generate_signal(candles, size, symbol, ts)
                     if signal:
                         try:
                             self.order_manager.execute_signal(signal, ts)
-                        except Exception as exc:  # exchange errors should halt the bot
+                            self._last_trade_time["scalp"] = ts
+                        except Exception as exc:
                             self.last_error = str(exc)
                             self.state = BotState.ERROR
                             return
@@ -447,12 +446,11 @@ class TradingBot:
                     risk = abs(signal.price - signal.stop_loss)
                     if risk <= 0:
                         continue
-                    # FIXED: Use live equity
                     live_equity = self._get_live_equity()
                     size = self.volume_manager.compute_size(
                         strategy_id="candle3",
                         risk_pct=self.risk_manager.config.risk_per_trade_pct,
-                        equity=live_equity,  # FIXED: was self.config.equity
+                        equity=live_equity,
                         atr=risk,
                         k=1.0,
                         expected_trades_left=self.expected_trades_left.get("candle3", 1),
@@ -462,7 +460,6 @@ class TradingBot:
                     size = self.exchange_client.normalize_qty(symbol, size)
                     if size <= 0:
                         continue
-                    # NEW: Pre-trade margin check
                     if not self._margin_check(signal.price, size, symbol):
                         continue
                     signal = TradeSignal(
@@ -480,10 +477,10 @@ class TradingBot:
                         self.order_manager.execute_signal(signal, ts)
                         Thread(
                             target=self._monitor_strategy_c,
-                            args=(symbol, "candle3", 180),  # FIX: 3 candles x 60s = 3-minute minimum hold (was 30)
+                            args=(symbol, "candle3", 30),
                             daemon=True,
                         ).start()
-                    except Exception as exc:  # exchange errors should halt the bot
+                    except Exception as exc:
                         self.last_error = str(exc)
                         self.state = BotState.ERROR
                         return
@@ -582,12 +579,11 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: invalid risk. symbol={symbol}")
             return
 
-        # FIXED: Use live equity
         live_equity = self._get_live_equity()
         size = self.volume_manager.compute_size(
             strategy_id="trend",
             risk_pct=self.risk_manager.config.risk_per_trade_pct,
-            equity=live_equity,  # FIXED: was self.config.equity
+            equity=live_equity,
             atr=risk,
             k=1.0,
             expected_trades_left=self.expected_trades_left.get("trend", 1),
@@ -598,7 +594,6 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: size below min. symbol={symbol}")
             return
 
-        # Min notional check for hybrid
         notional = size * entry_price
         if notional < self.MIN_NOTIONAL_USD:
             logger.warning(
@@ -607,7 +602,6 @@ class TradingBot:
             self.order_manager.log_event("INFO", f"Hybrid: notional too small. symbol={symbol}")
             return
 
-        # NEW: Pre-trade margin check
         if not self._margin_check(entry_price, size, symbol):
             return
 
@@ -681,8 +675,7 @@ class TradingBot:
 
     def _monitor_strategy_c(self, symbol: str, strategy_id: str, delay_seconds: int) -> None:
         """
-        Close after minimum hold period (delay_seconds) or on stop-loss hit.
-        delay_seconds should be >= 180 (3 x 60s candles) to avoid premature exits.
+        Close after fixed seconds or on stop-loss/take-profit.
         """
         while True:
             position = self.position_manager.get_position(symbol, strategy_id)
@@ -698,6 +691,14 @@ class TradingBot:
                 if position.side.upper() == "SELL" and price >= position.stop_loss:
                     self.order_manager.close_position(symbol, strategy_id, price, datetime.now(timezone.utc))
                     return
+                # Check take-profit if set
+                if position.take_profit is not None:
+                    if position.side.upper() == "BUY" and price >= position.take_profit:
+                        self.order_manager.close_position(symbol, strategy_id, price, datetime.now(timezone.utc))
+                        return
+                    if position.side.upper() == "SELL" and price <= position.take_profit:
+                        self.order_manager.close_position(symbol, strategy_id, price, datetime.now(timezone.utc))
+                        return
             except Exception as exc:
                 self.last_error = str(exc)
                 # Continue to enforce time-based close even if price fetch fails.
