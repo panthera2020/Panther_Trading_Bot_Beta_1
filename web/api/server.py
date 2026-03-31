@@ -63,13 +63,8 @@ else:
     )
     bot = TradingBot(
         BotConfig(
-            use_hybrid_trend=os.getenv("USE_HYBRID_TREND", "true").lower() in {"1", "true", "yes"},
-            max_spread=float(os.getenv("HYBRID_MAX_SPREAD", "2.0")),
-            vol_spike_mult=float(os.getenv("HYBRID_VOL_SPIKE_MULT", "3.0")),
-            entry_wait_minutes=int(os.getenv("HYBRID_ENTRY_WAIT_MIN", "5")),
             cooldown_seconds=int(os.getenv("HYBRID_COOLDOWN_SEC", "120")),
-            # NEW: equity is just a fallback default; the bot fetches real balance on startup
-            equity=float(os.getenv("BOT_FALLBACK_EQUITY", "500")),  # Small account safe default
+            equity=float(os.getenv("BOT_FALLBACK_EQUITY", "500")),
             margin_safety_pct=float(os.getenv("BOT_MARGIN_SAFETY_PCT", "0.20")),
             balance_cache_ttl=float(os.getenv("BOT_BALANCE_CACHE_TTL", "15.0")),
         ),

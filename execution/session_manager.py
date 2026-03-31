@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Dict
+from datetime import datetime, timezone
+from typing import List
 
 
 @dataclass(frozen=True)
@@ -10,50 +10,21 @@ class SessionPolicy:
     name: str
     start_hour: int
     end_hour: int
-    strategy_size_mult: Dict[str, float]
+    strategy_id: str
+
+
+# Each session owns exactly one strategy running at full capacity.
+# No percentage splits — the active strategy uses pure risk-based sizing.
+SESSIONS: List[SessionPolicy] = [
+    SessionPolicy(name="ASIA",   start_hour=0,  end_hour=8,  strategy_id="candle3"),
+    SessionPolicy(name="LONDON", start_hour=8,  end_hour=16, strategy_id="scalp"),
+    SessionPolicy(name="NY",     start_hour=16, end_hour=24, strategy_id="trend"),
+]
 
 
 class SessionManager:
     def __init__(self) -> None:
-        # FIX v1.1: All sessions now carry a scalp multiplier > 0.
-        # Previously ASIA had no "scalp" key, which caused the scalp condition
-        # (session.strategy_size_mult.get("scalp", 0.0) > 0) to evaluate False
-        # and block all scalp trades during the 8-hour ASIA window.
-        # That killed ~33% of available trading time for the highest-frequency
-        # strategy. Now ASIA uses a 0.5x size multiplier for scalp — smaller
-        # positions, still generating volume overnight.
-        self._sessions = [
-            SessionPolicy(
-                name="ASIA",
-                start_hour=0,
-                end_hour=8,
-                strategy_size_mult={
-                    "scalp": 0.5,   # FIX v1.1: was missing — ASIA now trades scalp
-                    "trend": 0.3,
-                    "candle3": 1.0,
-                },
-            ),
-            SessionPolicy(
-                name="LONDON",
-                start_hour=8,
-                end_hour=16,
-                strategy_size_mult={
-                    "scalp": 0.8,
-                    "trend": 0.6,
-                    "candle3": 0.5,
-                },
-            ),
-            SessionPolicy(
-                name="NY",
-                start_hour=16,
-                end_hour=24,
-                strategy_size_mult={
-                    "scalp": 1.0,
-                    "trend": 1.0,
-                    "candle3": 0.3,
-                },
-            ),
-        ]
+        self._sessions = SESSIONS
 
     def current_session(self, timestamp: datetime | None = None) -> SessionPolicy:
         ts = timestamp or datetime.now(timezone.utc)
@@ -63,19 +34,5 @@ class SessionManager:
                 return session
         return self._sessions[-1]
 
-    def is_within_window(
-        self,
-        timestamp: datetime,
-        start_hour: int,
-        start_minute: int,
-        end_hour: int,
-        end_minute: int,
-        tz_offset_hours: int = 0,
-    ) -> bool:
-        tz = timezone(timedelta(hours=tz_offset_hours))
-        local_ts = timestamp.astimezone(tz)
-        start = local_ts.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
-        end = local_ts.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
-        if end <= start:
-            return local_ts >= start or local_ts <= end
-        return start <= local_ts <= end
+    def is_strategy_allowed(self, strategy_id: str, timestamp: datetime) -> bool:
+        return self.current_session(timestamp).strategy_id == strategy_id

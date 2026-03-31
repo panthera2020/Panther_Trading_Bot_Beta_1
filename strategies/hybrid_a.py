@@ -4,12 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from strategies.indicators import ema, atr
+from strategies.indicators import ema, atr, atr_from_candles
 
 
 @dataclass
 class SweepEvent:
-    direction: str  # "LONG" or "SHORT"
+    direction: str
     level: float
     timestamp: datetime
 
@@ -41,7 +41,7 @@ class LiquiditySweepDetector:
     def detect(self, candles: List[Dict[str, float]], bias: str) -> Optional[SweepEvent]:
         if bias == "NONE" or len(candles) < self.lookback + 2:
             return None
-        window = candles[-(self.lookback + 1) : -1]
+        window = candles[-(self.lookback + 1):-1]
         last = candles[-1]
         if bias == "LONG":
             prior_low = min(c["low"] for c in window)
@@ -58,15 +58,8 @@ class EntryExecutor:
     def __init__(self, max_entry_wait_minutes: int = 5):
         self.max_entry_wait_minutes = max_entry_wait_minutes
 
-    def should_enter(
-        self,
-        sweep: SweepEvent,
-        candles_1m: List[Dict[str, float]],
-        bias: str,
-    ) -> bool:
-        if sweep is None or bias == "NONE":
-            return False
-        if sweep.direction != bias:
+    def should_enter(self, sweep: SweepEvent, candles_1m: List[Dict[str, float]], bias: str) -> bool:
+        if sweep is None or bias == "NONE" or sweep.direction != bias:
             return False
         if not candles_1m:
             return False
@@ -77,15 +70,6 @@ class EntryExecutor:
         bullish = last["close"] > last["open"]
         bearish = last["close"] < last["open"]
         return (bias == "LONG" and bullish) or (bias == "SHORT" and bearish)
-
-
-def atr_1m(candles: List[Dict[str, float]], period: int = 14) -> Optional[float]:
-    if len(candles) < period + 1:
-        return None
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    closes = [c["close"] for c in candles]
-    return atr(highs, lows, closes, period)
 
 
 def _ts(candle: Dict[str, float]) -> datetime:
