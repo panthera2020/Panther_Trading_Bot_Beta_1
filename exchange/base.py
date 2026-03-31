@@ -6,6 +6,12 @@ from exchange.types import OrderResult
 
 
 class ExchangeClient(Protocol):
+    """Contract: any exchange adapter must implement these methods.
+
+    To add a new exchange (e.g. Binance), create a class that satisfies
+    this protocol — no inheritance needed, just implement the methods.
+    """
+
     def create_order(
         self,
         symbol: str,
